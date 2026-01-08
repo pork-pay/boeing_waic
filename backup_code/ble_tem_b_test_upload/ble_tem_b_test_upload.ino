@@ -1,0 +1,153 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// ================== 串口（接 A 板） ==================
+#define SENSOR_RX 5
+HardwareSerial SensorSerial(2);
+
+// ================== WiFi 配置 ==================
+// const char* ssid     = "Redmi_103";
+// const char* password = "103@ISEE";
+const char* ssid     = "zju-test-wifi-5";
+const char* password = "1234567890";
+// const char* ssid     = "Netcore-DB56EE";
+// const char* password = "12345678";
+// ================== MQTT 配置 ==================
+const char* mqtt_server = "192.168.100.219";
+const int   mqtt_port   = 1883;
+const char* mqtt_topic  = "v1/devices/me/telemetry";
+const char* TB_TOKEN    = "uoutY77bCKx2Nh0QOFKE";
+
+WiFiClient   wifiClient;
+PubSubClient mqtt(wifiClient);
+
+// ================== 最新值缓存 ==================
+float latestTemp = NAN;
+int   latestRssi = 127;
+
+// ================== 稳定的 WiFi 连接 ==================
+void setupWiFi() {
+  Serial.print("Connecting to WiFi "); Serial.print(ssid); Serial.println(" ...");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  Serial.print("IP Address: "); Serial.println(WiFi.localIP());
+}
+
+// ================== 修复的 MQTT 逻辑 ==================
+void setupMqtt() {
+  mqtt.setServer(mqtt_server, mqtt_port);  // 只在初始化时设置一次
+  mqtt.setKeepAlive(600);                   // 可选：设置保活时间
+}
+void ensureMqtt() {
+  if (mqtt.connected()) return;
+  mqtt.setServer(mqtt_server, mqtt_port);
+  String clientId = "ESP32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  Serial.print("Connecting to MQTT ... ");
+  if (mqtt.connect(clientId.c_str(), TB_TOKEN, NULL)) {
+    Serial.println("connected.");
+  } else {
+    Serial.print("failed, rc="); Serial.println(mqtt.state());
+  }
+}
+
+// ================== 上报函数 ==================
+bool publishTempRssi() {
+  ensureMqtt();
+  if (!mqtt.connected()) {
+    Serial.println("MQTT not connected, skip publish");
+    return false;
+  }
+
+  String payload = "{";
+  bool first = true;
+
+  if (!isnan(latestTemp)) {
+    payload += "\"temperature\":" + String(latestTemp, 2);
+    first = false;
+  }
+  if (latestRssi < 127) {
+    if (!first) payload += ",";
+    payload += "\"rssi\":" + String(latestRssi);
+  }
+  payload += "}";
+
+  Serial.print("Publish: "); Serial.println(payload);
+  bool ok = mqtt.publish(mqtt_topic, payload.c_str());
+  if (!ok) {
+    Serial.println("MQTT publish failed");
+    // 发布失败时断开连接，下次会重连
+   // mqtt.disconnect();
+  }
+  return ok;
+}
+
+// ================== 解析函数保持不变 ==================
+void parseLine(const char* s) {
+  const char* tptr = strstr(s, "T:");
+  const char* rptr = strstr(s, "R:");
+
+  bool updated = false;
+
+  if (tptr) {
+    latestTemp = atof(tptr + 2);
+    updated = true;
+  }
+  if (rptr) {
+    latestRssi = atoi(rptr + 2);
+    updated = true;
+  }
+
+  Serial.print("[B] parsed: "); Serial.println(s);
+
+  if (updated) {
+    publishTempRssi();
+  }
+}
+
+// ================== 修复的 setup() ==================
+void setup() {
+  Serial.begin(115200);
+  SensorSerial.begin(115200, SERIAL_8N1, SENSOR_RX, -1);
+
+  setupWiFi();
+  setupMqtt();  // 新增：单独初始化 MQTT
+  ensureMqtt(); // 初始连接尝试
+
+  Serial.println("ESP32-B (UART RX@5 -> MQTT temperature+rssi) Ready");
+}
+
+// ================== 主循环 ==================
+void loop() {
+  if (!mqtt.connected()) {
+    ensureMqtt();
+  } else {
+    mqtt.loop();  // 只有连接成功时才调用 loop()
+  }
+
+  // 串口数据处理保持不变
+  static char lineBuf[64];
+  static int lineLen = 0;
+
+  while (SensorSerial.available()) {
+    char c = (char)SensorSerial.read();
+    if (c == '\n' || c == '\r') {
+      if (lineLen > 0) {
+        lineBuf[lineLen] = '\0';
+        parseLine(lineBuf);
+        lineLen = 0;
+      }
+    } else {
+      if (lineLen < (int)sizeof(lineBuf) - 1) {
+        lineBuf[lineLen++] = c;
+      } else {
+        lineLen = 0;
+      }
+    }
+  }
+
+  delay(5);
+}
